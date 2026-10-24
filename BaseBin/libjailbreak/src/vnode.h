@@ -1,6 +1,6 @@
 //
 //  vnode.h
-//  TrollInstallerX
+//  Dopamine3_Rootful
 //
 //  Created by Alfie on 01/04/2024.
 //
@@ -10,8 +10,12 @@
 
 #import <Foundation/Foundation.h>
 
-NSArray *get_installed_apps(void);
-bool is_persistence_helper_installed(const char **pathOut);
-bool install_persistence_helper_via_vnode(const char *bundlePath);
+uint64_t get_vnode_for_path(const char *path);
+uint64_t get_vnode_for_path_by_chdir(const char *path);
+uint64_t get_child_vnode_from_vnode(uint64_t vnode, const char *file);
+bool vnode_chown(uint64_t vnode, uid_t uid, gid_t gid);
+bool vnode_chmod(uint64_t vnode, mode_t mode);
+uint64_t vnode_redirect_folder(const char *to, const char *from);
+bool vnode_unredirect_folder(const char *folder, uint64_t orig);
 
 #endif /* VNODE_H */
