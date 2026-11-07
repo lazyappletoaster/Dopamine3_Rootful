@@ -554,6 +554,7 @@ void jbinfo_initialize_hardcoded_offsets(void)
 															if (hasSPTM) {
 																// pmap
 																gSystemInfo.kernelStruct.pmap.txm_address_space = 0x98;
+																gSystemInfo.kernelStruct.pmap.sw_asid = 0xB6 + pmapEl2Adjust;
 
 																// TXMAddressSpace
 																gSystemInfo.kernelStruct.TXMAddressSpace.codeRegions       = 0x28;

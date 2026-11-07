@@ -21,6 +21,8 @@
 #import <libjailbreak/display.h>
 #import <libjailbreak/machine_info.h>
 #import <libjailbreak/carboncopy.h>
+#import <libjailbreak/primitives.h>
+#import <libjailbreak/vnode.h>
 
 #import <IOKit/IOKitLib.h>
 #import "DOUIManager.h"
@@ -32,6 +34,21 @@
 int reboot3(uint64_t flags, ...);
 CFPropertyListRef MGCopyAnswer(CFStringRef);
 extern char **environ;
+
+@interface DOEnvironmentManager ()
+{
+    // Mount path -> original v_data of the redirected vnode, so a redirect can be undone
+    NSMutableDictionary<NSString *, NSNumber *> *_vnodeRedirects;
+}
+@end
+
+static BOOL DOKernelReadWriteIsAvailable(void)
+{
+    // The vnode helpers talk to the kernel directly, so they must never be reached
+    // from a process that did not build the read / write primitive itself
+    return gPrimitives.kreadbuf != NULL
+        || (gPrimitives.physreadbuf != NULL && gPrimitives.vtophys != NULL);
+}
 
 @implementation DOEnvironmentManager
 
@@ -50,6 +67,7 @@ extern char **environ;
     self = [super init];
     if (self) {
         _bootstrapNeedsMigration = NO;
+        _vnodeRedirects = [NSMutableDictionary dictionary];
         _bootstrapper = [[DOBootstrapper alloc] init];
         if ([self isJailbroken]) {
             gSystemInfo.jailbreakInfo.rootPath = strdup(jbclient_get_jbroot() ?: "");
@@ -612,21 +630,109 @@ extern char **environ;
     }
 }
 
+- (BOOL)isVnodeRedirectedAtPath:(NSString *)path
+{
+    return path != nil && _vnodeRedirects[path] != nil;
+}
+
+- (uint64_t)vnodeForPath:(NSString *)path
+{
+    if (!path) return (uint64_t)-1;
+    return get_vnode_for_path(path.fileSystemRepresentation);
+}
+
+// Mounting a folder here means pointing the vnode of mountPath at the filesystem data of
+// sourcePath, which is what a bind mount does, but without the mount syscall. The original
+// data is kept so the redirect can be restored by unmountVnodeAtPath:.
+- (BOOL)mountVnodeAtPath:(NSString *)mountPath fromPath:(NSString *)sourcePath
+{
+    if (!mountPath || !sourcePath) return NO;
+    if ([self isVnodeRedirectedAtPath:mountPath]) return YES;
+    if (!DOKernelReadWriteIsAvailable()) return NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) return NO;
+
+    uint64_t originalData = vnode_redirect_folder(mountPath.fileSystemRepresentation, sourcePath.fileSystemRepresentation);
+    if (originalData == (uint64_t)-1) return NO;
+
+    _vnodeRedirects[mountPath] = @(originalData);
+    return YES;
+}
+
+- (BOOL)unmountVnodeAtPath:(NSString *)mountPath
+{
+    NSNumber *originalData = mountPath ? _vnodeRedirects[mountPath] : nil;
+    if (!originalData) return NO;
+
+    if (!vnode_unredirect_folder(mountPath.fileSystemRepresentation, originalData.unsignedLongLongValue)) {
+        return NO;
+    }
+
+    [_vnodeRedirects removeObjectForKey:mountPath];
+    return YES;
+}
+
+// Writes owner, group and mode into the vnode belonging to path directly. A path that has
+// been redirected only differs inside the kernel, so its ownership has to be written to the
+// vnode as well instead of going through the filesystem.
+- (BOOL)writeVnodeAttributesAtPath:(NSString *)path owner:(uid_t)uid group:(gid_t)gid mode:(mode_t)mode
+{
+    if (!DOKernelReadWriteIsAvailable()) return NO;
+
+    uint64_t vnode = [self vnodeForPath:path];
+    if (vnode == (uint64_t)-1) return NO;
+
+    return vnode_chown(vnode, uid, gid) && vnode_chmod(vnode, mode);
+}
+
 - (BOOL)isFakelibMounted
 {
+    if ([self isVnodeRedirectedAtPath:@"/usr/lib"]) return YES;
+
     struct statfs fsb;
     if (statfs("/usr/lib", &fsb) != 0) return NO;
     return strcmp(fsb.f_mntonname, "/usr/lib") == 0;
 }
 
+- (BOOL)mountFakelib
+{
+    if (![self mountVnodeAtPath:@"/usr/lib" fromPath:JBROOT_PATH(@"/basebin/.fakelib")]) {
+        return NO;
+    }
+
+    // /usr/lib is used by launchd and by every process that links against a library, so the
+    // redirect has to stay root owned and readable no matter which user created it. This is
+    // written to the vnode, the files behind the redirect are not reachable that way.
+    for (NSString *path in @[ @"/usr/lib", @"/usr/lib/dyld", @"/usr/lib/systemhook.dylib" ]) {
+        if (![self writeVnodeAttributesAtPath:path owner:0 group:0 mode:0755]) {
+            [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"Writing vnode attributes for %@ failed", path] debug:YES];
+        }
+    }
+
+    return YES;
+}
+
 - (int)setFakelibMounted:(BOOL)mounted
 {
-    int r = 0;
-    if (mounted != [self isFakelibMounted]) {
-        NSString *arg = mounted ? @"mount" : @"unmount";
-        r = [self spawnJbctlAsRootWithArgs:@[@"internal", @"fakelib", arg]];
+    if (mounted) {
+        if ([self isFakelibMounted]) return 0;
+
+        // Make sure the rootful bootstrap volumes and the fakelib contents are in place
+        int r = [self spawnJbctlAsRootWithArgs:@[ @"internal", @"fakelib", @"mount" ]];
+        if (r != 0) return r;
+
+        // Then mount the fake library on top of /usr/lib with a vnode redirect
+        if (![self mountFakelib]) return -1;
+        return 0;
     }
-    return r;
+    else {
+        if ([self isVnodeRedirectedAtPath:@"/usr/lib"]) {
+            return [self unmountVnodeAtPath:@"/usr/lib"] ? 0 : -1;
+        }
+        if ([self isFakelibMounted]) {
+            return [self spawnJbctlAsRootWithArgs:@[ @"internal", @"fakelib", @"unmount" ]];
+        }
+        return 0;
+    }
 }
 
 - (int)setPrivatePrebootProtected:(BOOL)protected
