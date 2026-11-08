@@ -3,12 +3,16 @@ APFS volume creator/bootstrapper/mounter
 
 **DO NOT DELETE .DOPAMINE_ROOTFUL DIRECTORY, IT IS A FLAG THAT PARTITION IS NOT CORRUPTED**
 
-# Tested Devices and iOS Versions
+# Tested Devices and iOS Versions (Old)
 Special thanks to @Sergey5588 for testing this thing for me.
 - iPhone 11: iOS 16.3.1 (20D67)
 - iPhone SE 2020: iOS 15.2 (19C56)
 - iPhone SE 2016: iOS 15.8.4 (19H390)
 
+# About To Be Tested On:
+Special thanks to @lazyappletoaster
+- iPad 9 iOS 26.0 RC
+  
 # Usage
 `makerwapfs create {path} {volName}`
 
@@ -16,6 +20,7 @@ Special thanks to @Sergey5588 for testing this thing for me.
 **volName**: Any string to identify the volume. This is needed to stay far away from entering path to disk device manually.
 
 ## How it works
+bootstrapfs uses vnode now! Trying to bypass LaunchConstraints
 On iOS 16 and newer `create` does not touch APFS: the folder is served out of the bootstrap copy inside the jailbreak root (`/usr` -> `<jbroot>/usr`) by pointing its vnode at that copy, and owner / mode are written into the vnode instead of being applied by path. Every read and write the tool performs goes through the vnode, `libjailbreak` and the kernel r/w primitive it needs are picked up at runtime from the jailbreak root.
 
 On iOS 15 and older the tool keeps the volume based path: the APFS volume is created, the folder is copied into it and it is mounted over the folder.
