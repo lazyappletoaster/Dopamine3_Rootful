@@ -237,24 +237,27 @@ void jbupdate_finalize_stage2(const char *prevVersion, const char *newVersion)
 		snprintf(msg, 4000, "Dopamine: Updating patched dyld failed due to unexpected amount of cdhashes (%d), cannot continue.", cdhashesCount);
 		abort_with_reason(7, 1, msg, 0);
 	}
-	else if (cdhashesCount == 1) {
-		trustcache_file_v1 *dyldTCFile = NULL;
-		r = trustcache_file_build_from_cdhashes(cdhashes, cdhashesCount, &dyldTCFile);
-		free(cdhashes);
-		if (r != 0) {
-			char msg[4000];
-			snprintf(msg, 4000, "Dopamine: Building dyld trustcache failed with error %d, cannot continue.", r);
-			abort_with_reason(7, 1, msg, 0);
-		}
+	else if (cdhashesCount == 1) {	trustcache_file_v2 *dyldTCFile = NULL;
+	r = trustcache_file_build_from_cdhashes(cdhashes, cdhashesCount, &dyldTCFile);
+	free(cdhashes);
+	if (r != 0) {
+		char msg[4000];
+		snprintf(msg, 4000, "Dopamine: Building dyld trustcache failed with error %d, cannot continue.", r);
+		abort_with_reason(7, 1, msg, 0);
+	}
 
-		r = trustcache_file_upload_with_uuid(dyldTCFile, DYLD_TRUSTCACHE_UUID);
-		if (r != 0) {
-			char msg[4000];
-			snprintf(msg, 4000, "Dopamine: Updating dyld trustcache failed with error %d, cannot continue.", r);
-			abort_with_reason(7, 1, msg, 0);
-		}
+	if (trustcache_file_disable_launch_constraints(&dyldTCFile) != 0) {
+		abort_with_reason(7, 1, "Dopamine: Failed to disable LaunchConstraints on dyld trustcache", 0);
+	}
+	r = trustcache_file_upload_with_uuid(dyldTCFile, DYLD_TRUSTCACHE_UUID);
+	if (r != 0) {
+		char msg[4000];
+		snprintf(msg, 4000, "Dopamine: Updating dyld trustcache failed with error %d, cannot continue.", r);
+		abort_with_reason(7, 1, msg, 0);
+	}
 
-		free(dyldTCFile);
+	free(dyldTCFile);
+
 	}
 
 	JBFixMobilePermissions();
