@@ -40,5 +40,7 @@ typedef struct apfs_mount_args apfs_mount_args_t;
 int initialize_calls(void);
 char* getName(char* volume);
 int mount_apfs(const char *dir, int flags, char *device);
-int64_t (*_APFSVolumeCreate)(char* device, CFMutableDictionaryRef args);
-uint64_t (*_APFSVolumeDelete)(char* device);
+// Defined once in apfs_utils.m, declared here so every file that includes this
+// header does not emit its own copy of the symbol
+extern int64_t (*_APFSVolumeCreate)(char* device, CFMutableDictionaryRef args);
+extern uint64_t (*_APFSVolumeDelete)(char* device);

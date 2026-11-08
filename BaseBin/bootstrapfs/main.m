@@ -24,6 +24,7 @@
 #include "dirutils.h"
 #include <sys/param.h>
 #include "apfs_utils.h"
+#include "vnode_utils.h"
 
 /*
 Idea:
@@ -91,19 +92,18 @@ char* walkPartitions(const char* volumeNameIn) {
 }
 
 
-bool check_partition(char* path) {
+// 1 -> prepared, 0 -> not prepared, -1 -> could not be read through the vnode
+int check_partition(char* path) {
+    if (!path) return -1;
+    if (vnode_calls_init() != 0) return -1;
+
     char path_internal[512] = {0};
-    strcpy(path_internal, path);
-    strcat(path_internal, "/.Dopamine_Rootful/fsPrepared");
-    debug("Checking partition at path: %s\n", &path_internal);
-    if (access(path_internal, F_OK) == 0) {
-        debug("Partition ok\n");
-        return true;
-    } else {
-        debug("Partition corrupted\n");
-        return false;
-    }
-    return true; // ???
+    snprintf(path_internal, sizeof(path_internal), "%s/.Dopamine_Rootful/fsPrepared", path);
+    debug("Checking partition at path: %s\n", path_internal);
+
+    int prepared = vnode_path_exists(path_internal) ? 1 : 0;
+    debug(prepared ? "Partition ok\n" : "Partition corrupted\n");
+    return prepared;
 }
 
 int prepare_dopamine_partition(char* path, char* volumeNameIn) {
@@ -140,6 +140,14 @@ int prepare_dopamine_partition(char* path, char* volumeNameIn) {
     dprintf(fd, "Hello untether");
     close(fd);
 
+    // The flag lives on the new volume, stamping it through the vnode keeps its
+    // ownership independent of the umask of whoever created it
+    if (vnode_calls_init() == 0) {
+        if (!vnode_write_attrs(prepared_flag, 0, 0, 0644)) {
+            debug("Could not write the vnode attributes of %s\n", prepared_flag);
+        }
+    }
+
     ret = copy_dir_recursive(path, tempMount); // copy all direcory from <path> to tempMount
     debug("copy dir recursive returned %i\n", ret);
 
@@ -147,7 +155,70 @@ int prepare_dopamine_partition(char* path, char* volumeNameIn) {
 }
 
 
-int create_apfs_partition(char* path, char* volumeNameIn) {
+// Every failure is reported as a code, so a caller can tell the cases apart
+typedef enum {
+    BSFS_OK                      = 0,
+    BSFS_ERR_NO_KERNEL_PRIMITIVE = 1,
+    BSFS_ERR_NO_TARGET_VNODE     = 2,
+    BSFS_ERR_NO_SOURCE_VNODE     = 3,
+    BSFS_ERR_REDIRECT_FAILED     = 4,
+    BSFS_ERR_ATTRIBUTES_FAILED   = 5,
+} bsfs_error;
+
+static bool bsfs_uses_vnode_overlay(void) {
+    // iOS 16 and newer have no usable APFS mount path here, every read and write
+    // has to go through the vnode. Older versions keep the volume based fallback.
+    if (@available(iOS 16.0, *)) {
+        return true;
+    }
+    return false;
+}
+
+// Points <path> at the bootstrap copy of the same path inside the jailbreak
+// root: reads and writes only touch vnode data, nothing is copied and no path
+// based syscall is involved
+static int create_vnode_overlay(char *path, char *volumeNameIn) {
+    (void)volumeNameIn;
+
+    if (vnode_calls_init() != 0) {
+        printf_error("[-] FAIL: no kernel r/w available for the vnode of %s\n", path);
+        return BSFS_ERR_NO_KERNEL_PRIMITIVE;
+    }
+
+    char *jbrootPath = getItemInJBROOT(path);
+    if (!jbrootPath || jbrootPath[0] == '\0') {
+        printf_error("[-] FAIL: unable to resolve %s inside the jailbreak root\n", path);
+        return BSFS_ERR_NO_SOURCE_VNODE;
+    }
+
+    uint64_t targetData = vnode_read_data_for_path(path);
+    if (targetData == 0) {
+        printf_error("[-] FAIL: no vnode for %s\n", path);
+        return BSFS_ERR_NO_TARGET_VNODE;
+    }
+
+    uint64_t sourceData = vnode_read_data_for_path(jbrootPath);
+    if (sourceData == 0) {
+        printf_error("[-] FAIL: no vnode for %s\n", jbrootPath);
+        return BSFS_ERR_NO_SOURCE_VNODE;
+    }
+
+    if (targetData == sourceData) {
+        printf_success("[+] %s already reads and writes %s\n", path, jbrootPath);
+        return BSFS_OK;
+    }
+
+    uint64_t origData = 0;
+    if (vnode_redirect_folder_at_path(path, jbrootPath, 0, 0, 0755, &origData) != 0) {
+        printf_error("[-] FAIL: unable to point %s at %s\n", path, jbrootPath);
+        return BSFS_ERR_REDIRECT_FAILED;
+    }
+
+    printf_success("[+] %s now reads and writes %s\n", path, jbrootPath);
+    return BSFS_OK;
+}
+
+static int create_apfs_partition_legacy(char* path, char* volumeNameIn) {
     // put code in here
     uint64_t credBackup = 0;
     int ret = 0;
@@ -177,9 +248,14 @@ int create_apfs_partition(char* path, char* volumeNameIn) {
             printf("[-] FAIL: mount_apfs returned %i\n", ret);
         }
         // need to check, if partition has dopamine flags.
-        bool is_prepared = check_partition(path);
+        int prepared = check_partition(path);
 
-        if (!is_prepared) {
+        if (prepared < 0) {
+            printf_error("[-] FAIL: unable to read the vnode of %s, not touching the partition\n", path);
+            return BSFS_ERR_NO_KERNEL_PRIMITIVE;
+        }
+
+        if (prepared == 0) {
             printf("Partition invalid, killing it\n");
 
             debug("Giving kernel privileges\n");
@@ -232,6 +308,16 @@ int create_apfs_partition(char* path, char* volumeNameIn) {
     return 0;
 }
 
+int create_apfs_partition(char* path, char* volumeNameIn) {
+    if (bsfs_uses_vnode_overlay()) {
+        // iOS 16 and newer: a failure is reported instead of being hidden behind
+        // the volume based fallback
+        return create_vnode_overlay(path, volumeNameIn);
+    }
+
+    return create_apfs_partition_legacy(path, volumeNameIn);
+}
+
 int main(int argc, char *argv[]) {
     int ret = 0;
     if (getuid() != 0) {
@@ -259,12 +345,12 @@ int main(int argc, char *argv[]) {
         }
         const char *path = argv[2];
         const char *volumeNameIn = argv[3];
-        int ret = create_apfs_partition(path, volumeNameIn);
-        if (ret == 0) {
-            printf_success("[+] APFS partition is now on %s\n", path);
+        ret = create_apfs_partition(path, volumeNameIn);
+        if (ret == BSFS_OK) {
+            printf_success("[+] %s is writable\n", path);
         }
         else {
-            printf_error("[-] Failed to mount APFS partition over %s\n", path);
+            printf_error("[-] Preparing %s failed with error code %i\n", path, ret);
         }
     }
     else {

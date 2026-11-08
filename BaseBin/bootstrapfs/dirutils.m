@@ -223,6 +223,13 @@ char* jbrootpath() {
 // Get any item in the jbroot
 char* getItemInJBROOT(char* item) {
     char* jbroot = jbrootpath();
-    strcat(jbroot, item);
-    return jbroot;
+    if (!jbroot || !item) return NULL;
+
+    // jbrootpath points into an autoreleased string, appending to it in place
+    // wrote past its storage
+    size_t length = strlen(jbroot) + strlen(item) + 1;
+    char* result = malloc(length);
+    if (!result) return NULL;
+    snprintf(result, length, "%s%s", jbroot, item);
+    return result;
 }
