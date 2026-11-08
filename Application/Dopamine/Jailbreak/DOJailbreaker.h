@@ -17,6 +17,9 @@ NS_ASSUME_NONNULL_BEGIN
 }
 
 - (void)runWithError:(NSError **)errOut didRemoveJailbreak:(BOOL*)didRemove showLogs:(BOOL *)showLogs;
+- (BOOL)loadBasebinTrustcacheWithError:(NSError **)errOut;
+
+
 - (void)finalize;
 
 - (BOOL)contiguousMappingWorkaroundNeeded;
