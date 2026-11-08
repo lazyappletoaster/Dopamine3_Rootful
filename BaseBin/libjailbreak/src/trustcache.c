@@ -7,10 +7,46 @@
 #include "info.h"
 #include "primitives.h"
 
-void _trustcache_file_init(trustcache_file_v1 *file)
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(trustcache_entry_v2) == sizeof(trustcache_entry_v1) + 2, "version 2 trust cache entries must only add the constraint category and reserved bytes");
+_Static_assert(sizeof(trustcache_file_v2) == sizeof(trustcache_file_v1), "version 1 and version 2 trust cache files must share the same header layout");
+#endif
+
+size_t trustcache_file_entry_size(uint32_t version)
+{
+	if (version == TC_FILE_VERSION_V2) {
+		return sizeof(trustcache_entry_v2);
+	}
+	return sizeof(trustcache_entry_v1);
+}
+
+static bool _trustcache_file_version_is_supported(uint32_t version)
+{
+	return version == TC_FILE_VERSION_V1 || version == TC_FILE_VERSION_V2;
+}
+
+size_t trustcache_file_size(trustcache_file_v1 *tc)
+{
+	if (!tc || !_trustcache_file_version_is_supported(tc->version)) return 0;
+	return sizeof(trustcache_file_v1) + (tc->length * trustcache_file_entry_size(tc->version));
+}
+
+bool trustcache_v2_supported(void)
+{
+	// LaunchConstraints and with them the version 2 trust cache format were introduced in iOS 16.
+	// Kernels before that only understand version 1 modules, so they must not be handed a version 2 one.
+	return ksymbol(ppl_trust_cache_rt) != 0 || ksymbol_txm(txm_trustcache_root) != 0;
+}
+
+static uint32_t _jb_trustcache_version(void)
+{
+	return trustcache_v2_supported() ? TC_FILE_VERSION_V2 : TC_FILE_VERSION_V1;
+}
+
+static void _trustcache_file_init(trustcache_file_v1 *file, uint32_t version)
 {
 	memset(file, 0, sizeof(*file));
-	file->version = 1;
+	file->version = version;
 	uuid_generate(file->uuid);
 }
 
@@ -124,16 +160,15 @@ int trustcache_list_remove(uint64_t tcKaddr)
 	return 0;
 }
 
-int _trustcache_file_sort_entry_comparator_v1(const void * vp1, const void * vp2)
+int _trustcache_file_sort_entry_comparator(const void *vp1, const void *vp2)
 {
-	trustcache_entry_v1* tc1 = (trustcache_entry_v1*)vp1;
-	trustcache_entry_v1* tc2 = (trustcache_entry_v1*)vp2;
-	return memcmp(tc1->hash, tc2->hash, sizeof(cdhash_t));
+	// Both formats start every entry with the cdhash, so this works regardless of the entry size
+	return memcmp(vp1, vp2, sizeof(cdhash_t));
 }
 
 void _trustcache_file_sort(trustcache_file_v1 *file)
 {
-	qsort(file->entries, file->length, sizeof(trustcache_entry_v1), _trustcache_file_sort_entry_comparator_v1);
+	qsort(file->entries, file->length, trustcache_file_entry_size(file->version), _trustcache_file_sort_entry_comparator);
 }
 
 bool _is_jb_trustcache(uint64_t tcKaddr)
@@ -172,7 +207,7 @@ uint64_t _jb_trustcache_grow(void)
 
 	jb_trustcache *jbTc = alloca(sizeof(jb_trustcache));
 	memset(jbTc, 0, sizeof(jb_trustcache));
-	_trustcache_file_init(&jbTc->file);
+	_trustcache_file_init(&jbTc->file, _jb_trustcache_version());
 	jbTc->magic = JB_MAGIC;
 	*(uint64_t *)(jbTc->trustcache + koffsetof(trustcache, fileptr)) = (jbTcKern + offsetof(jb_trustcache, file));
 	if (koffsetof(trustcache, size)) {
@@ -186,15 +221,27 @@ uint64_t _jb_trustcache_grow(void)
 	return jbTcKern;
 }
 
+static uint32_t _jb_trustcache_entry_capacity(uint32_t version)
+{
+	size_t entriesOffset = offsetof(jb_trustcache, file) + offsetof(trustcache_file_v1, entries);
+	return (JB_TRUSTCACHE_SIZE - entriesOffset) / trustcache_file_entry_size(version);
+}
+
 int jb_trustcache_add_entries(struct trustcache_entry_v1 *entries, uint32_t entryCount)
 {
+	uint32_t version = _jb_trustcache_version();
+	size_t entrySize = trustcache_file_entry_size(version);
+	uint32_t entryCapacity = _jb_trustcache_entry_capacity(version);
+
 	uint32_t remainingEntryCount = entryCount;
 	while (remainingEntryCount > 0) {
 		__block uint64_t freeJbTcKaddr = 0;
 		__block uint32_t freeJbTcCurrentLength = 0;
 		_jb_trustcache_enumerate(^(uint64_t jbTcKaddr, bool *stop) {
+			// Only append to modules that use the same entry format, mixing versions would corrupt them
+			uint32_t moduleVersion = kread32(jbTcKaddr + offsetof(jb_trustcache, file.version));
 			uint32_t length = kread32(jbTcKaddr + offsetof(jb_trustcache, file.length));
-			if (length < JB_TRUSTCACHE_ENTRY_COUNT) {
+			if (moduleVersion == version && length < entryCapacity) {
 				freeJbTcKaddr = jbTcKaddr;
 				freeJbTcCurrentLength = length;
 				*stop = true;
@@ -202,17 +249,26 @@ int jb_trustcache_add_entries(struct trustcache_entry_v1 *entries, uint32_t entr
 		});
 		if (freeJbTcKaddr == 0) {
 			freeJbTcKaddr = _jb_trustcache_grow();
+			if (freeJbTcKaddr == 0) return -1;
 		}
 
-		uint32_t entryCountToInsert = JB_TRUSTCACHE_ENTRY_COUNT - freeJbTcCurrentLength;
+		uint32_t entryCountToInsert = entryCapacity - freeJbTcCurrentLength;
 		if (remainingEntryCount < entryCountToInsert) {
 			entryCountToInsert = remainingEntryCount;
 		}
 
 		jb_trustcache *jbTc = alloca(JB_TRUSTCACHE_SIZE);
 		kreadbuf(freeJbTcKaddr, jbTc, JB_TRUSTCACHE_SIZE);
+		uint8_t *jbTcEntries = (uint8_t *)jbTc + offsetof(jb_trustcache, file) + offsetof(trustcache_file_v1, entries);
 		for (uint32_t i = 0; i < entryCountToInsert; i++) {
-			jbTc->file.entries[freeJbTcCurrentLength+i] = entries[i];
+			// Entries are written in the format of the running kernel, with the constraint category
+			// set to "no constraints" so AMFI does not enforce any LaunchConstraints on them
+			trustcache_entry_v2 entry = { 0 };
+			memcpy(entry.hash, entries[i].hash, sizeof(cdhash_t));
+			entry.hash_type = entries[i].hash_type;
+			entry.flags = entries[i].flags;
+			entry.constraint_category = TC_CONSTRAINT_CATEGORY_NONE;
+			memcpy(jbTcEntries + ((freeJbTcCurrentLength + i) * entrySize), &entry, entrySize);
 		}
 		jbTc->file.length += entryCountToInsert;
 		_trustcache_file_sort(&jbTc->file);
@@ -260,11 +316,15 @@ xpc_object_t jb_trustcache_info(void)
 		xpc_object_t tcDict = xpc_dictionary_create_empty();
 		xpc_dictionary_set_data(tcDict, "uuid", &uuid, sizeof(uuid));
 
+		uint32_t version = kread32(jbTcKaddr + offsetof(jb_trustcache, file.version));
+		size_t entrySize = trustcache_file_entry_size(version);
+		uint64_t entriesKaddr = jbTcKaddr + offsetof(jb_trustcache, file) + offsetof(trustcache_file_v1, entries);
+
 		xpc_object_t hashesArr = xpc_array_create_empty();
-		for (int i = 0; i < length; i++) {
-			trustcache_entry_v1 entry;
-			kreadbuf(jbTcKaddr + offsetof(jb_trustcache, file.entries[i]), &entry, sizeof(entry));
-			xpc_array_set_data(hashesArr, XPC_ARRAY_APPEND, &entry.hash, sizeof(entry.hash));
+		for (uint32_t i = 0; i < length; i++) {
+			cdhash_t hash;
+			kreadbuf(entriesKaddr + (i * entrySize), hash, sizeof(cdhash_t));
+			xpc_array_set_data(hashesArr, XPC_ARRAY_APPEND, hash, sizeof(cdhash_t));
 		}
 		xpc_dictionary_set_value(tcDict, "cdhashes", hashesArr);
 		xpc_release(hashesArr);
@@ -284,24 +344,95 @@ void jb_trustcache_debug_print(FILE *f)
 		uint32_t length = kread32(jbTcKaddr + offsetof(jb_trustcache, file.length));
 
 		uint32_t *uuidData = (uint32_t *)uuid;
-		fprintf(f, "Jailbreak TrustCache %d <%08x%08x%08x%08x> (length: %u) (kaddr: 0x%llx):\n", i++, htonl(uuidData[0]), htonl(uuidData[1]), htonl(uuidData[2]), htonl(uuidData[3]), length, jbTcKaddr);
+		uint32_t version = kread32(jbTcKaddr + offsetof(jb_trustcache, file.version));
+		size_t entrySize = trustcache_file_entry_size(version);
+		uint64_t entriesKaddr = jbTcKaddr + offsetof(jb_trustcache, file) + offsetof(trustcache_file_v1, entries);
+
+		fprintf(f, "Jailbreak TrustCache %d <%08x%08x%08x%08x> (version: %u) (length: %u) (kaddr: 0x%llx):\n", i++, htonl(uuidData[0]), htonl(uuidData[1]), htonl(uuidData[2]), htonl(uuidData[3]), version, length, jbTcKaddr);
 		
 		for (uint32_t j = 0; j < length; j++) {
-			trustcache_entry_v1 entry;
-			kreadbuf(jbTcKaddr + offsetof(jb_trustcache, file.entries[j]), &entry, sizeof(entry));
+			cdhash_t hash;
+			kreadbuf(entriesKaddr + (j * entrySize), hash, sizeof(cdhash_t));
 			fprintf(f, "| ");
 			for (uint32_t k = 0; k < sizeof(cdhash_t); k++) {
-				fprintf(f, "%02x", entry.hash[k]);
+				fprintf(f, "%02x", hash[k]);
 			}
 			fprintf(f, "\n");
 		}
 	});
 }
 
+// Copies a trust cache file into the version 2 format with every entry assigned constraint
+// category 0 ("no constraints"). This is what disables LaunchConstraints for the cdhashes in it,
+// including for cdhashes that are also covered by a static trust cache with an assigned category.
+// Returns a malloc'd file the caller owns, or NULL if the input format is unknown.
+static trustcache_file_v1 *_trustcache_file_copy_without_constraints(trustcache_file_v1 *tc)
+{
+	if (!tc || !_trustcache_file_version_is_supported(tc->version)) return NULL;
+
+	size_t entrySize = trustcache_file_entry_size(TC_FILE_VERSION_V2);
+	size_t newSize = sizeof(trustcache_file_v2) + (tc->length * entrySize);
+	trustcache_file_v2 *tcNoConstraints = malloc(newSize);
+	if (!tcNoConstraints) return NULL;
+	memset(tcNoConstraints, 0, newSize);
+
+	tcNoConstraints->version = TC_FILE_VERSION_V2;
+	tcNoConstraints->length = tc->length;
+	memcpy(tcNoConstraints->uuid, tc->uuid, sizeof(uuid_t));
+
+	for (uint32_t i = 0; i < tc->length; i++) {
+		trustcache_entry_v2 *dstEntry = &tcNoConstraints->entries[i];
+		if (tc->version == TC_FILE_VERSION_V2) {
+			memcpy(dstEntry, &((trustcache_file_v2 *)tc)->entries[i], sizeof(*dstEntry));
+		}
+		else {
+			memcpy(dstEntry->hash, tc->entries[i].hash, sizeof(cdhash_t));
+			dstEntry->hash_type = tc->entries[i].hash_type;
+			dstEntry->flags = tc->entries[i].flags;
+		}
+		dstEntry->constraint_category = TC_CONSTRAINT_CATEGORY_NONE;
+		dstEntry->reserved = 0;
+	}
+
+	return (trustcache_file_v1 *)tcNoConstraints;
+}
+
+int trustcache_file_disable_launch_constraints(trustcache_file_v1 **tcInOut)
+{
+	if (!tcInOut || !*tcInOut) return -1;
+
+	trustcache_file_v1 *tcNoConstraints = _trustcache_file_copy_without_constraints(*tcInOut);
+	if (!tcNoConstraints) return -1;
+
+	free(*tcInOut);
+	*tcInOut = tcNoConstraints;
+	return 0;
+}
+
 int trustcache_file_upload(trustcache_file_v1 *tc)
 {
-	uint64_t tcSize = ksizeof(trustcache) + sizeof(trustcache_file_v1) + (tc->length * sizeof(trustcache_entry_v1));
-	if (tcSize > 0x4000) return -1;
+	if (!tc || !_trustcache_file_version_is_supported(tc->version)) return -1;
+
+	// Everything we upload should have LaunchConstraints turned off, so whenever the running kernel
+	// understands the version 2 format we upgrade the file and assign every entry category 0.
+	// Older kernels only know version 1, on those the file is uploaded unchanged (and a version 2
+	// file is rejected rather than handed to a kernel that cannot parse it).
+	trustcache_file_v1 *noConstraintsTc = NULL;
+	if (trustcache_v2_supported()) {
+		noConstraintsTc = _trustcache_file_copy_without_constraints(tc);
+	}
+	trustcache_file_v1 *tcToUpload = noConstraintsTc ? noConstraintsTc : tc;
+
+	if (tcToUpload->version == TC_FILE_VERSION_V2 && !trustcache_v2_supported()) {
+		free(noConstraintsTc);
+		return -1;
+	}
+
+	uint64_t tcSize = ksizeof(trustcache) + trustcache_file_size(tcToUpload);
+	if (tcSize > 0x4000) {
+		free(noConstraintsTc);
+		return -1;
+	}
 
 	// Check if there is already a TrustCache with the same UUID
 	__block uint64_t existingTcKaddr = 0;
@@ -309,7 +440,7 @@ int trustcache_file_upload(trustcache_file_v1 *tc)
 		uint64_t tcFileKaddr = kread64(tcKaddr + koffsetof(trustcache, fileptr));
 		uuid_t tcFileUUID;
 		kreadbuf(tcFileKaddr + offsetof(trustcache_file_v1, uuid), tcFileUUID, sizeof(tcFileUUID));
-		if (memcmp(tcFileUUID, tc->uuid, sizeof(tcFileUUID)) == 0) {
+		if (memcmp(tcFileUUID, tcToUpload->uuid, sizeof(tcFileUUID)) == 0) {
 			existingTcKaddr = tcKaddr;
 			*stop = true;
 		}
@@ -319,15 +450,18 @@ int trustcache_file_upload(trustcache_file_v1 *tc)
 	if (existingTcKaddr != 0) {
 		if (_is_jb_trustcache(existingTcKaddr)) {
 			// There is something terribly wrong, abort
+			free(noConstraintsTc);
 			return -1;
 		}
 
 		uint64_t prevTcFile = kread64(existingTcKaddr + koffsetof(trustcache, fileptr));
+		uint32_t prevTcVersion = kread32(prevTcFile + offsetof(trustcache_file_v1, version));
 		uint32_t prevTcLength = kread32(prevTcFile + offsetof(trustcache_file_v1, length));
-		uint64_t prevTcSize = ksizeof(trustcache) + sizeof(trustcache_file_v1) + (prevTcLength * sizeof(trustcache_entry_v1));
+		uint64_t prevTcSize = ksizeof(trustcache) + sizeof(trustcache_file_v1) + (prevTcLength * trustcache_file_entry_size(prevTcVersion));
 		if (prevTcSize == tcSize) {
 			// If size is the same this is simple, just replace the file data
-			kwritebuf(prevTcFile, tc, tcSize - ksizeof(trustcache));
+			kwritebuf(prevTcFile, tcToUpload, tcSize - ksizeof(trustcache));
+			free(noConstraintsTc);
 			return 0;
 		}
 		else {
@@ -336,6 +470,7 @@ int trustcache_file_upload(trustcache_file_v1 *tc)
 			// So we do the next best thing, we remove it from the linked list and wait a bit before freeing it, hoping that any
 			// outstanding reads on the memory would be done by then
 			if (trustcache_list_remove(existingTcKaddr) != 0) {
+				free(noConstraintsTc);
 				return -1; // really unlikely error, if this triggers the world is probably upside down
 			}
 			usleep(10000); // hope for current accesses to finish if there are any (new accesses won't come as we removed the list entry)
@@ -345,7 +480,10 @@ int trustcache_file_upload(trustcache_file_v1 *tc)
 	}
 
 	uint64_t tcKaddr = 0;
-	if (kalloc(&tcKaddr, tcSize) != 0) return -1;
+	if (kalloc(&tcKaddr, tcSize) != 0) {
+		free(noConstraintsTc);
+		return -1;
+	}
 
 	// kalloc is not guaranteed to be zeroed, make sure trustcache head is zeroed
 	char nullBuf[ksizeof(trustcache)];
@@ -353,7 +491,7 @@ int trustcache_file_upload(trustcache_file_v1 *tc)
 	kwritebuf(tcKaddr, nullBuf, sizeof(nullBuf));
 
 	uint64_t tcFileKaddr = tcKaddr + ksizeof(trustcache);
-	kwritebuf(tcFileKaddr, tc, tcSize - ksizeof(trustcache));
+	kwritebuf(tcFileKaddr, tcToUpload, tcSize - ksizeof(trustcache));
 
 	kwrite64(tcKaddr + koffsetof(trustcache, fileptr), tcFileKaddr);
 	if (koffsetof(trustcache, size)) {
@@ -364,6 +502,7 @@ int trustcache_file_upload(trustcache_file_v1 *tc)
 	}
 
 	trustcache_list_insert(tcKaddr);
+	free(noConstraintsTc);
 	return 0;
 }
 
@@ -379,7 +518,7 @@ int trustcache_file_build_from_cdhashes(cdhash_t *CDHashes, uint32_t CDHashCount
 
 	size_t tcSize = sizeof(trustcache_file_v1) + (sizeof(trustcache_entry_v1) * CDHashCount);
 	trustcache_file_v1 *file = malloc(tcSize);
-	_trustcache_file_init(file);
+	_trustcache_file_init(file, TC_FILE_VERSION_V1);
 
 	file->length = CDHashCount;
 	for (uint32_t i = 0; i < CDHashCount; i++) {
@@ -409,7 +548,13 @@ int trustcache_file_build_from_path(const char *filePath, trustcache_file_v1 **t
 	read(fd, file, tcSize);
 	close(fd);
 
-	size_t actualTcSize = sizeof(trustcache_file_v1) + (sizeof(trustcache_entry_v1) * file->length);
+	if (!_trustcache_file_version_is_supported(file->version)) {
+		// Unknown TrustCache version, we do not know how big its entries are
+		free(file);
+		return -1;
+	}
+
+	size_t actualTcSize = sizeof(trustcache_file_v1) + (trustcache_file_entry_size(file->version) * file->length);
 	if (actualTcSize != tcSize) {
 		// Size mismatch, file is malformed
 		free(file);
@@ -423,8 +568,13 @@ int trustcache_file_build_from_path(const char *filePath, trustcache_file_v1 **t
 bool trustcache_contains_cdhash(uint64_t tcKaddr, cdhash_t CDHash)
 {
 	uint64_t tcFileKaddr = kread64(tcKaddr + koffsetof(trustcache, fileptr));
+	uint32_t version = kread32(tcFileKaddr + offsetof(trustcache_file_v1, version));
 	uint32_t length = kread32(tcFileKaddr + offsetof(trustcache_file_v1, length));
 	if (length == 0) return false;
+
+	// Version 2 entries are larger, so the stride between entries depends on the file version
+	size_t entrySize = trustcache_file_entry_size(version);
+	uint64_t entriesKaddr = tcFileKaddr + offsetof(trustcache_file_v1, entries);
 
 	int32_t left = 0;
 	int32_t right = length - 1;
@@ -432,7 +582,7 @@ bool trustcache_contains_cdhash(uint64_t tcKaddr, cdhash_t CDHash)
 	while (left <= right) {
 		int32_t mid = (left + right) / 2;
 		cdhash_t itCDHash;
-		kreadbuf(tcFileKaddr + offsetof(trustcache_file_v1, entries[mid].hash), itCDHash, CS_CDHASH_LEN);
+		kreadbuf(entriesKaddr + (mid * entrySize), itCDHash, CS_CDHASH_LEN);
 		int32_t cmp = memcmp(CDHash, itCDHash, CS_CDHASH_LEN);
 		if (cmp == 0) {
 			return true;
