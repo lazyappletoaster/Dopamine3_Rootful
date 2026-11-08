@@ -1,17 +1,17 @@
 <img src="https://github.com/opa334/Dopamine/assets/52459150/ed04dd3e-d879-456d-9aa3-d4ed44819c7e" width="64" />
 
-# Dopamine - Rootful Edition
+# Dopamine - Rootful Edition For iOS 16+
 Official website / download original Dopamine: https://ellekit.space/dopamine/
 
-A rootful semi-untethered jailbreak for iOS 15.x (arm64 and arm64e). More details will follow here soon.<br>
+A rootful semi-untethered jailbreak for iOS 16+ (arm64 and arm64e). More details will follow here soon.<br>
 This version includes full support for tweaks and is rootful.<br>
 
 **Please note that all issues related to version support will be deleted without response.**<br>
 
 # WARNING - ONLY FOR DEVELOPERS
 Feel free to fix it if you want to, but note that offsets for userspace PAC.<br>
-This thing might break your device, was not tested on iOS 16+<br>
-On iOS 16 it will NOT work out-of-box due to missing LaunchConstraints bypass and I dont have a device to develop one. <br>
+This thing might break your device, probably unstable<br>
+On iOS 16 it will work soon out-of-box with LaunchConstraints bypass attempts and I have a device to develop one. <br>
 
 # Tested Devices and iOS Versions
 - iPhone SE 2020: iOS 15.2
