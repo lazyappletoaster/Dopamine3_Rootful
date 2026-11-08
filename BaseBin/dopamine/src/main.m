@@ -50,6 +50,7 @@ DOJailbreaker *gJb;
 - (NSError *)ensureDevModeEnabled;
 - (NSError *)gatherSystemInformation;
 - (NSError *)loadBasebinTrustcache;
+- (BOOL)loadBasebinTrustcacheWithError:(NSError **)errOut;
 - (NSError *)injectLaunchdHook;
 - (NSError *)applyProtection;
 - (NSError *)createFakeLib;
@@ -113,10 +114,14 @@ void activate_basebin(NSString *basebinPath)
 		exit(-1);
 	}
 	
-	trustcache_file_v1 *dyldTCFile = NULL;
+	trustcache_file_v2 *dyldTCFile = NULL;
 	int r = trustcache_file_build_from_cdhashes(cdhashes, cdhashesCount, &dyldTCFile);
 	free(cdhashes);
 	if (r == 0) {
+		if (trustcache_file_disable_launch_constraints(&dyldTCFile) != 0) {
+			printf("Activating basebin failed: trustcache_file_disable_launch_constraints failed\n");
+			exit(-1);
+		}
 		r = trustcache_file_upload_with_uuid(dyldTCFile, DYLD_TRUSTCACHE_UUID);
 		free(dyldTCFile);
 		if (r != 0) {
@@ -207,8 +212,8 @@ void update_var_jb_symlink(void)
 void load_basebin_trustcache(void)
 {
 	printf("Loading BaseBin Trustcache... "); fflush(stdout); usleep(1000);
-	NSError *error = [gJb loadBasebinTrustcache];
-	if (error) {
+	NSError *error = nil;
+	if (![gJb loadBasebinTrustcacheWithError:&error]) {
 		printf("\nLoading basebin trustcache failed: %s\n", error.description.UTF8String); fflush(stdout); usleep(1000);
 		exit(-1);
 	}
