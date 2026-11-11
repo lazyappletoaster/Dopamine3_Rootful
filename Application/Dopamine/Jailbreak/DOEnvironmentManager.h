@@ -74,6 +74,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)isPPLBypassRequired;
 
 - (NSError *)prepareBootstrap;
+- (NSError *)prepareRootfulBootstrap;
 - (NSError *)finalizeBootstrap;
 - (NSError *)deleteBootstrap;
 - (NSError *)reinstallPackageManagers;

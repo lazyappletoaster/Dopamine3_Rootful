@@ -44,6 +44,31 @@ struct hfs_mount_args {
 
 NSString *const bootstrapErrorDomain = @"BootstrapErrorDomain";
 
+// Rootful bootstrap setup
+//
+// The bootstrap content must never be written to the system volume (/) itself, as that would
+// break the Signed System Volume seal. bootstrapfs solves this by creating one APFS volume per
+// system directory, copying the stock content of that directory onto the new volume and then
+// mounting the volume over the original path. Writes into these paths (including the bootstrap)
+// then land on the new volume while the sealed system volume stays untouched.
+static NSArray<NSArray<NSString *> *> *rootfulOverlaySpecs(void)
+{
+    static NSArray<NSArray<NSString *> *> *specs = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // { mount path, APFS volume name }
+        specs = @[
+            @[ @"/usr", @"Usr" ],
+            @[ @"/Library", @"Library" ],
+            @[ @"/Applications", @"Applications" ],
+            @[ @"/private/etc", @"Etc" ],
+            @[ @"/sbin", @"Sbin" ],
+            @[ @"/bin", @"Bin" ],
+        ];
+    });
+    return specs;
+}
+
 @implementation DOBootstrapper
 
 - (instancetype)init
@@ -224,23 +249,167 @@ NSString *const bootstrapErrorDomain = @"BootstrapErrorDomain";
     [_bootstrapDownloadTask resume];
 }*/
 
-- (void)extractBootstrap:(NSString *)path withCompletion:(void (^)(NSError *))completion
+- (BOOL)isRootfulOverlayMountedAtPath:(NSString *)path
+{
+    struct statfs fsb;
+    if (statfs(path.fileSystemRepresentation, &fsb) != 0) return NO;
+    return strcmp(fsb.f_mntonname, path.fileSystemRepresentation) == 0;
+}
+
+- (NSError *)prepareRootfulOverlayMounts
+{
+    NSString *bootstrapfsPath = JBROOT_PATH(@"/basebin/bootstrapfs");
+    if (![[NSFileManager defaultManager] fileExistsAtPath:bootstrapfsPath]) {
+        return [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedRootfulBootstrap userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"bootstrapfs is missing at %@", bootstrapfsPath]}];
+    }
+
+    for (NSArray *spec in rootfulOverlaySpecs()) {
+        NSString *mountPath = (NSString *)spec[0];
+        NSString *volumeName = (NSString *)spec[1];
+
+        // Already mounted (e.g. jailbreaking a second time without a full reboot), nothing to do
+        if ([self isRootfulOverlayMountedAtPath:mountPath]) continue;
+
+        [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"Mounting %@ Volume", volumeName] debug:YES];
+
+        // bootstrapfs create <path> <volName>
+        int r = exec_cmd(bootstrapfsPath.fileSystemRepresentation, "create", mountPath.fileSystemRepresentation, volumeName.fileSystemRepresentation, NULL);
+        if (r != 0 || ![self isRootfulOverlayMountedAtPath:mountPath]) {
+            return [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedRootfulBootstrap userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"bootstrapfs failed to mount the %@ volume over %@ (returned %d)", volumeName, mountPath, r]}];
+        }
+    }
+
+    return nil;
+}
+
+- (NSError *)mergeItemAtPath:(NSString *)srcPath intoPath:(NSString *)dstPath
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *error = nil;
+
+    NSDictionary<NSFileAttributeKey, id> *srcAttributes = [fm attributesOfItemAtPath:srcPath error:nil];
+    if (!srcAttributes) return nil;
+    BOOL srcIsDirectory = [srcAttributes[NSFileType] isEqualToString:NSFileTypeDirectory];
+
+    NSDictionary<NSFileAttributeKey, id> *dstAttributes = [fm attributesOfItemAtPath:dstPath error:nil];
+    BOOL dstExists = (dstAttributes != nil);
+    BOOL dstIsDirectory = [dstAttributes[NSFileType] isEqualToString:NSFileTypeDirectory];
+
+    if (srcIsDirectory && dstExists && dstIsDirectory) {
+        NSArray<NSString *> *items = [fm contentsOfDirectoryAtPath:srcPath error:&error];
+        if (!items) return error;
+        for (NSString *item in items) {
+            error = [self mergeItemAtPath:[srcPath stringByAppendingPathComponent:item] intoPath:[dstPath stringByAppendingPathComponent:item]];
+            if (error) return error;
+        }
+        return nil;
+    }
+
+    // Files, symlinks and directories that do not exist yet replace what is there
+    if (dstExists) {
+        if (![fm removeItemAtPath:dstPath error:&error]) return error;
+    }
+    if (![fm copyItemAtPath:srcPath toPath:dstPath error:&error]) return error;
+    return nil;
+}
+
+- (NSError *)installRootfulBootstrapAtPath:(NSString *)path
 {
     NSString *bootstrapTar = [@"/var/tmp" stringByAppendingPathComponent:@"bootstrap.tar"];
-    NSError *decompressionError = [self decompressZstd:path toTar:bootstrapTar];
-    if (decompressionError) {
-        completion(decompressionError);
-        return;
+    NSError *error = [self decompressZstd:path toTar:bootstrapTar];
+    if (error) return error;
+
+    NSString *stagingPath = [@"/var/tmp" stringByAppendingPathComponent:[NSString stringWithFormat:@"dopamine-bootstrap-%@", [NSUUID UUID].UUIDString]];
+    error = [self extractTar:bootstrapTar toPath:stagingPath];
+    [[NSFileManager defaultManager] removeItemAtPath:bootstrapTar error:nil];
+    if (error) {
+        [[NSFileManager defaultManager] removeItemAtPath:stagingPath error:nil];
+        return error;
     }
-    
-    decompressionError = [self extractTar:bootstrapTar toPath:@"/"];
-    if (decompressionError) {
-        completion(decompressionError);
-        return;
+
+    // Only copy these paths out of the archive, they all resolve into a bootstrapfs overlay
+    // volume mounted over the read-only system volume. Everything else is deliberately skipped
+    // so that nothing can ever be written to the sealed system volume.
+    NSArray<NSString *> *overlayEntries = @[ @"usr", @"Library", @"Applications", @"sbin", @"bin", @"private/etc" ];
+    for (NSString *entry in overlayEntries) {
+        NSString *srcPath = [stagingPath stringByAppendingPathComponent:entry];
+        if (![[NSFileManager defaultManager] attributesOfItemAtPath:srcPath error:nil]) continue;
+
+        NSString *dstPath = [@"/" stringByAppendingPathComponent:entry];
+        if (![self isRootfulOverlayMountedAtPath:dstPath]) {
+            error = [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedRootfulBootstrap userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Refusing to install %@: no bootstrapfs volume is mounted over %@", entry, dstPath]}];
+            break;
+        }
+
+        error = [self mergeItemAtPath:srcPath intoPath:dstPath];
+        if (error) break;
     }
-    
+
+    [[NSFileManager defaultManager] removeItemAtPath:stagingPath error:nil];
+    if (error) return error;
+
     [[NSData data] writeToFile:JBROOT_PATH(@"/.installed_dopamine") atomically:YES];
-    completion(nil);
+    return nil;
+}
+
+- (void)applyRootfulBootstrapDefaults
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // Default APT sources go onto the /private/etc overlay volume
+    if ([self isRootfulOverlayMountedAtPath:@"/private/etc"]) {
+        NSString *sourcesDirectory = @"/etc/apt/sources.list.d";
+        [fm createDirectoryAtPath:sourcesDirectory withIntermediateDirectories:YES attributes:nil error:nil];
+
+        NSString *defaultSources = @"Types: deb\n"
+            @"URIs: https://repo.chariz.com/\n"
+            @"Suites: ./\n"
+            @"Components:\n"
+            @"\n"
+            @"Types: deb\n"
+            @"URIs: https://havoc.app/\n"
+            @"Suites: ./\n"
+            @"Components:\n"
+            @"\n"
+            @"Types: deb\n"
+            @"URIs: http://apt.thebigboss.org/repofiles/cydia/\n"
+            @"Suites: stable\n"
+            @"Components: main\n"
+            @"\n"
+            @"Types: deb\n"
+            @"URIs: https://ellekit.space/\n"
+            @"Suites: ./\n"
+            @"Components:\n";
+        [defaultSources writeToFile:[sourcesDirectory stringByAppendingPathComponent:@"default.sources"] atomically:NO encoding:NSUTF8StringEncoding error:nil];
+    }
+
+    // /var/mobile is on the data partition, it is not part of the SSV and always writable
+    NSString *mobilePreferencesPath = @"/var/mobile/Library/Preferences";
+    if (![fm fileExistsAtPath:mobilePreferencesPath]) {
+        NSDictionary<NSFileAttributeKey, id> *attributes = @{
+            NSFilePosixPermissions : @0755,
+            NSFileOwnerAccountID : @501,
+            NSFileGroupOwnerAccountID : @501,
+        };
+        [fm createDirectoryAtPath:mobilePreferencesPath withIntermediateDirectories:YES attributes:attributes error:nil];
+    }
+}
+
+- (NSError *)prepareRootfulBootstrap
+{
+    NSError *error = [self prepareRootfulOverlayMounts];
+    if (error) return error;
+
+    if (![[NSFileManager defaultManager] fileExistsAtPath:JBROOT_PATH(@"/.installed_dopamine")]) {
+        [[DOUIManager sharedInstance] sendLog:@"Extracting Bootstrap" debug:NO];
+
+        NSString *bootstrapZstdPath = [NSString stringWithFormat:@"%@/bootstrap_%@.tar.zst", [NSBundle mainBundle].bundlePath, [self bootstrapVersion]];
+        error = [self installRootfulBootstrapAtPath:bootstrapZstdPath];
+        if (error) return error;
+    }
+
+    [self applyRootfulBootstrapDefaults];
+    return nil;
 }
 
 - (NSError *)updateVarJbSymlink
@@ -446,10 +615,9 @@ NSString *const bootstrapErrorDomain = @"BootstrapErrorDomain";
             [self extractBootstrap:path withCompletion:bootstrapFinishedCompletion];
         };*/
         
-        [[DOUIManager sharedInstance] sendLog:@"Extracting Bootstrap" debug:NO];
-
-        NSString *bootstrapZstdPath = [NSString stringWithFormat:@"%@/bootstrap_%@.tar.zst", [NSBundle mainBundle].bundlePath, [self bootstrapVersion]];
-        [self extractBootstrap:bootstrapZstdPath withCompletion:bootstrapFinishedCompletion];
+        // The bootstrap itself is installed by prepareRootfulBootstrap once the launchd hook is up,
+        // because bootstrapfs needs the jbserver to create and mount the overlay volumes.
+        bootstrapFinishedCompletion(nil);
 
         /*NSString *documentsCandidate = @"/var/mobile/Documents/bootstrap.tar.zstd";
         NSString *bundleCandidate = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"bootstrap.tar.zstd"];

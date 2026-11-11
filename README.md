@@ -40,17 +40,42 @@ Note1: If bootstrapfs doesnt build - correct the sdk/ios version in Makefile
 Simply install the ipa/tipa file via Xcode or Trollstore
 
 # Bootstrapping
-It is not that trivial to bootstrap this jailbreak. To bootstrap it:
-- Download Filza for Trollstore
-- Download https://static.palera.in/bootstrap-1800.tar.zst rootful palera1n bootstrap for ios 15
-- Extract .tar from zstd archive
-- Jailbreak
-- Save the bootstrap-1800.tar to some known place in Filza (/private/preboot/bootstrap-1800.tar)
-- Open built-in Filza terminal and run following commands
-- `cd /`
-- `tar -xvf /private/preboot/bootstrap-1800.tar`
-- `kill 1`
-After this you will have basic jailbreak bootstrap with binaries needed for following steps.
+No manual bootstrap extraction is needed. The bootstrap is installed automatically while
+jailbreaking, using [bootstrapfs](https://github.com/ghh-jb/bootstrapfs) instead of extracting a
+tarball into `/`.
+
+The system volume is SSV (Signed System Volume) sealed and must never be written to. To get
+around this, once the launchd hook has been injected, Dopamine runs
+`/var/jb/basebin/bootstrapfs create <path> <volume>` for the following directories:
+
+| Directory | APFS volume |
+| --- | --- |
+| `/usr` | `Usr` |
+| `/Library` | `Library` |
+| `/Applications` | `Applications` |
+| `/private/etc` | `Etc` |
+| `/sbin` | `Sbin` |
+| `/bin` | `Bin` |
+
+For each of them `bootstrapfs` creates a new APFS volume, copies the stock content of that
+directory onto the volume and then mounts the volume over the original path. The bootstrap
+archive bundled inside the app (`bootstrap_<version>.tar.zst`, e.g. `bootstrap_1800.tar.zst` for
+iOS 15) is decompressed and extracted into `/var/tmp`, and only `usr`, `Library`, `Applications`,
+`sbin`, `bin` and `private/etc` from it are merged into the mounted volumes. Every other entry
+in the archive is ignored, so nothing is ever written to the sealed system volume and the SSV
+seal stays intact.
+
+Notes:
+- The volumes only exist while jailbroken. After a full reboot they are unmounted and the device
+  boots from the unmodified system volume.
+- Each volume contains a `.Dopamine_Rootful` directory that marks it as valid. Do not delete it,
+  `bootstrapfs` treats a volume without it as corrupted and recreates the volume.
+- The bootstrap is installed once (marked by `/.installed_dopamine` in the jailbreak root), later
+  jailbreaks only remount the existing volumes.
+- If mounting or installing fails, Dopamine aborts with a `bootstrapfs` error instead of leaving
+  a half-written bootstrap behind; fix the reported mount failure and jailbreak again.
+
+After this you will have a rootful bootstrap with the binaries needed for the following steps.
 
 # Fixing up dependencies
 In order to install Sileo and your preferred tweak injector (libhooker and ElleKit were tested) you need to install stub packages. Those are basically:

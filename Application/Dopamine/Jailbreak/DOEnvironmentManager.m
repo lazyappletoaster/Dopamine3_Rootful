@@ -830,6 +830,17 @@ extern char **environ;
     return errOut;
 }
 
+- (NSError *)prepareRootfulBootstrap
+{
+    __block NSError *errOut;
+    [self runAsRoot:^{
+        [self runUnsandboxed:^{
+            errOut = [self->_bootstrapper prepareRootfulBootstrap];
+        }];
+    }];
+    return errOut;
+}
+
 - (NSError *)finalizeBootstrap
 {
     return [_bootstrapper finalizeBootstrap];

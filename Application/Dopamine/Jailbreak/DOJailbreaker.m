@@ -62,6 +62,7 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     JBErrorCodeFailedInitProtection          = -12,
     JBErrorCodeFailedInitFakeLib             = -13,
     JBErrorCodeFailedDuplicateApps           = -14,
+    JBErrorCodeFailedRootfulBootstrap        = -15,
 };
 
 @implementation DOJailbreaker
@@ -676,6 +677,17 @@ void *boomerang_server(struct boomerang_info *info)
     
     // After the launchd hook is initialized, we need to make the app believe the device is jailbroken
     [[DOEnvironmentManager sharedManager] setJailbroken:YES withVersion:[NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.version") encoding:NSUTF8StringEncoding error:nil]];
+    
+    // Create the rootful bootstrap through bootstrapfs: for every system directory it creates a
+    // dedicated APFS volume, copies the stock content onto it and mounts it over the original path.
+    // The bootstrap is then installed into those volumes instead of the sealed system volume,
+    // which keeps the SSV seal intact.
+    [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Preparing Rootful Bootstrap") debug:NO];
+    *errOut = [[DOEnvironmentManager sharedManager] prepareRootfulBootstrap];
+    if (*errOut) {
+        [self cleanUpPostExploitation];
+        return;
+    }
     
     // Now that we can, protect important system files by bind mounting on top of them
     // This will be always be done during the userspace reboot

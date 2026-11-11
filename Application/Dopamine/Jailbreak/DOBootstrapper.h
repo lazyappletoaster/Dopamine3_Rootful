@@ -18,6 +18,7 @@ typedef NS_ENUM(NSInteger, BootstrapErrorCode) {
     BootstrapErrorCodeFailedRemount             = -5,
     BootstrapErrorCodeFailedFinalising          = -6,
     BootstrapErrorCodeFailedReplacing           = -7,
+    BootstrapErrorCodeFailedRootfulBootstrap    = -8,
 };
 
 @interface DOBootstrapper : NSObject <NSURLSessionDelegate, NSURLSessionDownloadDelegate>
@@ -28,6 +29,8 @@ typedef NS_ENUM(NSInteger, BootstrapErrorCode) {
 }
 
 - (void)prepareBootstrapWithCompletion:(void (^)(NSError *))completion;
+- (NSError *)prepareRootfulOverlayMounts;
+- (NSError *)prepareRootfulBootstrap;
 - (NSError *)updateVarJbSymlink;
 - (NSError *)ensurePrivatePrebootIsWritable;
 - (NSError *)installPackageManagers;
